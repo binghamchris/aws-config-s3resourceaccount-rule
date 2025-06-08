@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Config rule to check if IAM policies with S3 actions have the s3:ResourceAccount condition. Developed with Amazon Q Developer'
+
+Resources:
+  # IAM Role for Lambda Function
+  S3ResourceAccountCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConfigActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                  - config:ListDiscoveredResources
+                Resource: '*'
+        - PolicyName: IAMActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListPolicies
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListRoles
+                  - iam:ListRolePolicies
+                  - iam:GetRolePolicy
+                  - iam:ListUsers
+                  - iam:ListUserPolicies
+                  - iam:GetUserPolicy
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:policy/*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+
+  # Lambda Function
+  S3ResourceAccountCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3ResourceAccountCheck
+      Description: 'Checks if IAM policies with S3 actions have the s3:ResourceAccount condition'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3ResourceAccountCheckRole.Arn
+      Timeout: 3
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          
+          def evaluate_compliance(configuration_item, rule_parameters):
+              if configuration_item['resourceType'] not in ['AWS::IAM::Policy', 'AWS::IAM::Role', 'AWS::IAM::User']:
+                  return {
+                      'compliance_type': 'NOT_APPLICABLE',
+                      'annotation': 'This rule only applies to IAM policies, roles, and users.'
+                  }
+              
+              account_id = configuration_item['awsAccountId']
+              
+              # Extract policy document based on resource type
+              policy_document = None
+              try:
+                  if configuration_item['resourceType'] == 'AWS::IAM::Policy':
+                      # For managed policies
+                      policy_versions = configuration_item['configuration'].get('policyVersionList', [])
+                      if policy_versions:
+                          # Get the default version
+                          for version in policy_versions:
+                              if version.get('isDefaultVersion', False):
+                                  policy_document = json.loads(version.get('document', '{}'))
+                                  break
+                  elif configuration_item['resourceType'] in ['AWS::IAM::Role', 'AWS::IAM::User']:
+                      # For inline policies
+                      inline_policies = configuration_item['configuration'].get('inlinePolicies', {})
+                      if inline_policies:
+                          for policy_name, policy_details in inline_policies.items():
+                              try:
+                                  policy_doc = json.loads(policy_details.get('policyDocument', '{}'))
+                                  if not is_compliant(policy_doc, account_id):
+                                      return {
+                                          'compliance_type': 'NON_COMPLIANT',
+                                          'annotation': f'Inline policy {policy_name} contains S3 actions without proper s3:ResourceAccount condition.'
+                                      }
+                              except Exception as e:
+                                  print(f"Error processing inline policy {policy_name}: {str(e)}")
+                                  
+                      # Also check attached customer-managed policies (not AWS-managed)
+                      attached_policies = configuration_item['configuration'].get('attachedManagedPolicies', [])
+                      if attached_policies:
+                          iam = boto3.client('iam')
+                          for attached_policy in attached_policies:
+                              try:
+                                  policy_arn = attached_policy.get('policyArn')
+                                  # Skip AWS-managed policies (they start with "arn:aws:iam::aws:")
+                                  if policy_arn and not policy_arn.startswith('arn:aws:iam::aws:'):
+                                      policy_detail = iam.get_policy(PolicyArn=policy_arn)
+                                      policy_version = iam.get_policy_version(
+                                          PolicyArn=policy_arn,
+                                          VersionId=policy_detail['Policy']['DefaultVersionId']
+                                      )
+                                      policy_doc = policy_version['PolicyVersion']['Document']
+                                      if not is_compliant(policy_doc, account_id):
+                                          return {
+                                              'compliance_type': 'NON_COMPLIANT',
+                                              'annotation': f'Attached managed policy {policy_arn} contains S3 actions without proper s3:ResourceAccount condition.'
+                                          }
+                              except Exception as e:
+                                  print(f"Error processing attached policy {policy_arn}: {str(e)}")
+              except Exception as e:
+                  return {
+                      'compliance_type': 'NOT_APPLICABLE',
+                      'annotation': f'Error evaluating policy: {str(e)}'
+                  }
+              
+              if policy_document and not is_compliant(policy_document, account_id):
+                  return {
+                      'compliance_type': 'NON_COMPLIANT',
+                      'annotation': 'Policy contains S3 actions without proper s3:ResourceAccount condition.'
+                  }
+              
+              return {
+                  'compliance_type': 'COMPLIANT',
+                  'annotation': 'All S3 actions have proper s3:ResourceAccount condition.'
+              }
+          
+          def is_compliant(policy_document, account_id):
+              if not policy_document or "Statement" not in policy_document:
+                  return True
+              
+              for statement in policy_document["Statement"]:
+                  # Only check Allow statements
+                  if statement.get("Effect") != "Allow":
+                      continue
+                      
+                  # Check if statement contains S3 actions
+                  actions = statement.get("Action", [])
+                  if isinstance(actions, str):
+                      actions = [actions]
+                      
+                  # Check if any action is related to S3
+                  has_s3_action = False
+                  for action in actions:
+                      if isinstance(action, str) and action.startswith("s3:"):
+                          has_s3_action = True
+                          break
+                          
+                  if has_s3_action:
+                      # If there's an S3 action, check for the condition
+                      conditions = statement.get("Condition", {})
+                      has_valid_condition = False
+                      
+                      # Check various condition operators that might contain s3:ResourceAccount
+                      for condition_operator, condition_values in conditions.items():
+                          if "s3:ResourceAccount" in condition_values:
+                              condition_value = condition_values["s3:ResourceAccount"]
+                              
+                              # Handle both string and list values
+                              if isinstance(condition_value, str) and condition_value == account_id:
+                                  has_valid_condition = True
+                              elif isinstance(condition_value, list):
+                                  # All values in the list must match the account ID
+                                  has_valid_condition = all(val == account_id for val in condition_value)
+                      
+                      if not has_valid_condition:
+                          return False
+              
+              return True
+          
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event, indent=2))
+              
+              # Check if this is a scheduled notification
+              if is_scheduled_notification(event):
+                  return evaluate_scheduled_notification(event, context)
+                  
+              # Handle configuration item notification
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              # Skip if this is a deletion event
+              if 'configurationItemStatus' in invoking_event.get('configurationItem', {}) and \
+                 invoking_event['configurationItem']['configurationItemStatus'] == 'ResourceDeleted':
+                  print("Resource was deleted, skipping evaluation")
+                  return
+                  
+              configuration_item = invoking_event['configurationItem']
+              rule_parameters = json.loads(event.get('ruleParameters', '{}'))
+              
+              evaluation = evaluate_compliance(configuration_item, rule_parameters)
+              
+              config = boto3.client('config')
+              config.put_evaluations(
+                  Evaluations=[
+                      {
+                          'ComplianceResourceType': configuration_item['resourceType'],
+                          'ComplianceResourceId': configuration_item['resourceId'],
+                          'ComplianceType': evaluation['compliance_type'],
+                          'Annotation': evaluation['annotation'],
+                          'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+                      },
+                  ],
+                  ResultToken=event['resultToken']
+              )
+              
+          def is_scheduled_notification(event):
+              try:
+                  invoking_event = json.loads(event['invokingEvent'])
+                  return invoking_event.get('messageType') == 'ScheduledNotification'
+              except:
+                  return False
+                  
+          def evaluate_scheduled_notification(event, context):
+              print("Processing scheduled notification")
+              
+              iam = boto3.client('iam')
+              config = boto3.client('config')
+              account_id = context.invoked_function_arn.split(":")[4]
+              region = context.invoked_function_arn.split(":")[3]
+              
+              evaluations = []
+              
+              # Get resource IDs from AWS Config
+              managed_policy_ids = {}
+              role_ids = {}
+              user_ids = {}
+              
+              try:
+                  # Get all IAM managed policies from Config
+                  paginator = config.get_paginator('list_discovered_resources')
+                  for page in paginator.paginate(resourceType='AWS::IAM::Policy'):
+                      for resource in page.get('resourceIdentifiers', []):
+                          resource_id = resource.get('resourceId')
+                          resource_name = resource.get('resourceName')
+                          if resource_id and resource_name:
+                              managed_policy_ids[resource_name] = resource_id
+                  
+                  # Get all IAM roles from Config
+                  for page in paginator.paginate(resourceType='AWS::IAM::Role'):
+                      for resource in page.get('resourceIdentifiers', []):
+                          resource_id = resource.get('resourceId')
+                          resource_name = resource.get('resourceName')
+                          if resource_id and resource_name:
+                              role_ids[resource_name] = resource_id
+                  
+                  # Get all IAM users from Config
+                  for page in paginator.paginate(resourceType='AWS::IAM::User'):
+                      for resource in page.get('resourceIdentifiers', []):
+                          resource_id = resource.get('resourceId')
+                          resource_name = resource.get('resourceName')
+                          if resource_id and resource_name:
+                              user_ids[resource_name] = resource_id
+              except Exception as e:
+                  print(f"Error getting resources from Config: {str(e)}")
+              
+              # Get all IAM managed policies
+              try:
+                  # Only evaluate customer managed policies (not AWS managed)
+                  paginator = iam.get_paginator('list_policies')
+                  for page in paginator.paginate(Scope='Local'):
+                      for policy in page['Policies']:
+                          policy_detail = iam.get_policy(PolicyArn=policy['Arn'])
+                          policy_version = iam.get_policy_version(
+                              PolicyArn=policy['Arn'],
+                              VersionId=policy_detail['Policy']['DefaultVersionId']
+                          )
+                          policy_doc = policy_version['PolicyVersion']['Document']
+                          
+                          is_policy_compliant = is_compliant(policy_doc, account_id)
+                          
+                          policy_name = policy['PolicyName']
+                          # Use Config resource ID if available, otherwise use policy name
+                          resource_id = managed_policy_ids.get(policy_name, policy_name)
+                          
+                          evaluations.append({
+                              'ComplianceResourceType': 'AWS::IAM::Policy',
+                              'ComplianceResourceId': resource_id,
+                              'ComplianceType': 'COMPLIANT' if is_policy_compliant else 'NON_COMPLIANT',
+                              'Annotation': 'All S3 actions have proper s3:ResourceAccount condition.' if is_policy_compliant else 'Policy contains S3 actions without proper s3:ResourceAccount condition.',
+                              'OrderingTimestamp': datetime.datetime.now().isoformat()
+                          })
+              except Exception as e:
+                  print(f"Error evaluating managed policies: {str(e)}")
+                  
+              # Get all IAM roles and check their inline policies
+              try:
+                  paginator = iam.get_paginator('list_roles')
+                  for page in paginator.paginate():
+                      for role in page['Roles']:
+                          role_name = role['RoleName']
+                          role_compliant = True
+                          non_compliant_policy = ""
+                          
+                          # Check inline policies
+                          inline_policies = iam.list_role_policies(RoleName=role_name)
+                          for policy_name in inline_policies.get('PolicyNames', []):
+                              policy_response = iam.get_role_policy(RoleName=role_name, PolicyName=policy_name)
+                              policy_doc = policy_response['PolicyDocument']
+                              
+                              if not is_compliant(policy_doc, account_id):
+                                  role_compliant = False
+                                  non_compliant_policy = policy_name
+                                  break
+                          
+                          # Use Config resource ID if available, otherwise use role name
+                          resource_id = role_ids.get(role_name, role_name)
+                          
+                          evaluations.append({
+                              'ComplianceResourceType': 'AWS::IAM::Role',
+                              'ComplianceResourceId': resource_id,
+                              'ComplianceType': 'COMPLIANT' if role_compliant else 'NON_COMPLIANT',
+                              'Annotation': 'All S3 actions have proper s3:ResourceAccount condition.' if role_compliant else f'Inline policy {non_compliant_policy} contains S3 actions without proper s3:ResourceAccount condition.',
+                              'OrderingTimestamp': datetime.datetime.now().isoformat()
+                          })
+              except Exception as e:
+                  print(f"Error evaluating roles: {str(e)}")
+                  
+              # Get all IAM users and check their inline policies
+              try:
+                  paginator = iam.get_paginator('list_users')
+                  for page in paginator.paginate():
+                      for user in page['Users']:
+                          user_name = user['UserName']
+                          user_compliant = True
+                          non_compliant_policy = ""
+                          
+                          # Check inline policies
+                          inline_policies = iam.list_user_policies(UserName=user_name)
+                          for policy_name in inline_policies.get('PolicyNames', []):
+                              policy_response = iam.get_user_policy(UserName=user_name, PolicyName=policy_name)
+                              policy_doc = policy_response['PolicyDocument']
+                              
+                              if not is_compliant(policy_doc, account_id):
+                                  user_compliant = False
+                                  non_compliant_policy = policy_name
+                                  break
+                          
+                          # Use Config resource ID if available, otherwise use user name
+                          resource_id = user_ids.get(user_name, user_name)
+                          
+                          evaluations.append({
+                              'ComplianceResourceType': 'AWS::IAM::User',
+                              'ComplianceResourceId': resource_id,
+                              'ComplianceType': 'COMPLIANT' if user_compliant else 'NON_COMPLIANT',
+                              'Annotation': 'All S3 actions have proper s3:ResourceAccount condition.' if user_compliant else f'Inline policy {non_compliant_policy} contains S3 actions without proper s3:ResourceAccount condition.',
+                              'OrderingTimestamp': datetime.datetime.now().isoformat()
+                          })
+              except Exception as e:
+                  print(f"Error evaluating users: {str(e)}")
+              
+              # Submit evaluations in batches of 100 (AWS Config limit)
+              if evaluations:
+                  for i in range(0, len(evaluations), 100):
+                      batch = evaluations[i:i+100]
+                      try:
+                          config.put_evaluations(
+                              Evaluations=batch,
+                              ResultToken=event['resultToken']
+                          )
+                      except Exception as e:
+                          print(f"Error submitting evaluations: {str(e)}")
+
+  # Lambda Permission for Config
+  S3ResourceAccountCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt S3ResourceAccountCheckFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  # AWS Config Rule
+  S3ResourceAccountConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-resource-account-condition-check
+      Description: >
+        Checks if IAM policies with S3 actions have the s3:ResourceAccount condition key
+        with a value matching the AWS account ID.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::Policy
+          - AWS::IAM::Role
+          - AWS::IAM::User
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt S3ResourceAccountCheckFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: TwentyFour_Hours
