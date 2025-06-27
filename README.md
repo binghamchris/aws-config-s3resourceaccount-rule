@@ -1,9 +1,9 @@
 # AWS Config S3 ResourceAccount Condition Rule
 
-A custom AWS Config rule that checks if IAM policies with S3 actions have the `s3:ResourceAccount` condition key to help defend against S3 bucket namesquatting-type attacks.
+A custom AWS Config rule that checks if IAM policies with S3 actions have the `s3:ResourceAccount` condition key to help defend against S3 bucket sniping-type attacks.
 This code is intended to provide a starting point for implementing compliance checks appropriate to your own organisation's context.
 
-The contents of this rep were developed using Amazon Q Developer.
+The contents of this repo were developed using Amazon Q Developer.
 
 ## Overview
 
