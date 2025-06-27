@@ -54,7 +54,7 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt S3ResourceAccountCheckRole.Arn
-      Timeout: 3
+      Timeout: 10
       MemorySize: 128
       Code:
         ZipFile: |
