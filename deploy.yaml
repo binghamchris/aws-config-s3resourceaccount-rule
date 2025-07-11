@@ -51,7 +51,7 @@ Resources:
     Properties:
       FunctionName: S3ResourceAccountCheck
       Description: 'Checks if IAM policies with S3 actions have the s3:ResourceAccount condition'
-      Runtime: python3.9
+      Runtime: python3.12
       Handler: index.lambda_handler
       Role: !GetAtt S3ResourceAccountCheckRole.Arn
       Timeout: 10
